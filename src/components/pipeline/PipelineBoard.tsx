@@ -5,11 +5,11 @@ import {
   DndContext, DragEndEvent, DragOverlay, DragStartEvent,
   PointerSensor, useSensor, useSensors, closestCorners,
 } from '@dnd-kit/core';
-import { Lead, Stage, STAGES, isVacant, isOwnedBy, STAGE_COLORS } from '@/types';
+import { Lead, Stage, STAGES, STAGE_COLORS } from '@/types';
 import KanbanColumn from './KanbanColumn';
 import LeadCard from './LeadCard';
 import LeadDetailPanel from './LeadDetailPanel';
-import { MessageCircle, Instagram, Zap, Users } from 'lucide-react';
+import { Zap, Users } from 'lucide-react';
 
 interface Props {
   activeMember: string;
@@ -17,51 +17,50 @@ interface Props {
 
 type View = 'vacant' | 'mine';
 
-async function fetchLeads(): Promise<Lead[]> {
-  const res = await fetch('/api/leads');
-  const data: unknown = await res.json();
+/**
+ * A lead is vacant if nobody has claimed it yet.
+ * We check both "DMed by?" (empty) AND "DMed?" (not "yes") AND stage is New Lead / blank.
+ * ANY one of those being filled = claimed.
+ */
+function isVacant(lead: Lead): boolean {
+  const dmedYes  = lead.dmed.trim().toLowerCase() === 'yes';
+  const hasOwner = lead.dmedBy.trim() !== '';
+  const progressed = lead.stage !== 'New Lead' && lead.stage !== ('' as Stage);
+  return !dmedYes && !hasOwner && !progressed;
+}
 
-  if (!res.ok) {
-    const message =
-      typeof data === 'object' &&
-      data !== null &&
-      'error' in data &&
-      typeof data.error === 'string'
-        ? data.error
-        : 'Failed to fetch leads';
-    throw new Error(message);
-  }
-
-  if (Array.isArray(data)) {
-    return data as Lead[];
-  }
-
-  if (typeof data === 'object' && data !== null && 'leads' in data && Array.isArray(data.leads)) {
-    return data.leads as Lead[];
-  }
-
-  throw new Error('Invalid leads response received from /api/leads');
+/**
+ * A lead appears in a member's pipeline if they DMed it OR it's assigned to them.
+ * Case-insensitive comparison to handle any sheet inconsistencies.
+ */
+function isOwnedBy(lead: Lead, member: string): boolean {
+  const m = member.trim().toLowerCase();
+  return (
+    lead.dmedBy.trim().toLowerCase()     === m ||
+    lead.assignedTo.trim().toLowerCase() === m
+  );
 }
 
 export default function PipelineBoard({ activeMember }: Props) {
   const qc = useQueryClient();
-  const [search, setSearch] = useState('');
-  const [activeId, setActiveId] = useState<string | null>(null);
+  const [search, setSearch]           = useState('');
+  const [activeId, setActiveId]       = useState<string | null>(null);
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
-  const [view, setView] = useState<View>('vacant');
-  const [claimingId, setClaimingId] = useState<string | null>(null);
+  const [view, setView]               = useState<View>('vacant');
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
   );
 
-  const { data: leads = [], isLoading, isError, error } = useQuery<Lead[]>({
+  const { data: leads = [], isLoading } = useQuery<Lead[]>({
     queryKey: ['leads'],
-    queryFn: fetchLeads,
-    refetchInterval: 20_000, // poll every 20s so team sees each other's claims
+    queryFn: () => fetch('/api/leads').then(r => r.json()),
+    refetchInterval: 30_000,
+    // Keep previous data while fetching so the board never flickers blank
+    placeholderData: (prev) => prev,
   });
 
-  // ── Claim a lead (mark as DMed by activeMember) ──────────────────
+  // ── Claim ─────────────────────────────────────────────────────────
   const claimMutation = useMutation({
     mutationFn: async (lead: Lead) => {
       const res = await fetch(`/api/leads/${lead.rowIndex}`, {
@@ -76,34 +75,43 @@ export default function PipelineBoard({ activeMember }: Props) {
       });
       if (!res.ok) throw new Error('Claim failed');
     },
+
+    // 1. Immediately update local cache — move card to mine
     onMutate: async (lead) => {
       await qc.cancelQueries({ queryKey: ['leads'] });
-      const prev = qc.getQueryData<Lead[]>(['leads']);
-      // Optimistically mark as claimed
-      qc.setQueryData<Lead[]>(['leads'], old =>
-        (old ?? []).map(l => l.id === lead.id
-          ? { ...l, dmed: 'Yes', dmedBy: activeMember, stage: 'DMed', assignedTo: activeMember }
-          : l
+      const snapshot = qc.getQueryData<Lead[]>(['leads']);
+
+      qc.setQueryData<Lead[]>(['leads'], (old = []) =>
+        old.map(l =>
+          l.id === lead.id
+            ? { ...l, dmed: 'Yes', dmedBy: activeMember, assignedTo: activeMember, stage: 'DMed' }
+            : l
         )
       );
-      return { prev };
+
+      return { snapshot };
     },
-    onError: (_e, _v, ctx) => {
-      if (ctx?.prev) qc.setQueryData(['leads'], ctx.prev);
+
+    // 2. On error, roll back
+    onError: (_err, _lead, ctx) => {
+      if (ctx?.snapshot) qc.setQueryData(['leads'], ctx.snapshot);
     },
-    onSettled: (_, __, lead) => {
-      setClaimingId(null);
-      qc.invalidateQueries({ queryKey: ['leads'] });
-      qc.invalidateQueries({ queryKey: ['outreach'] });
-      // Auto-switch to My Pipeline after claiming
+
+    // 3. On success: switch view, then refetch after a 2s delay
+    //    (give Google Sheets time to persist the write before we re-read)
+    onSuccess: () => {
       setView('mine');
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ['leads'] });
+        qc.invalidateQueries({ queryKey: ['outreach'] });
+      }, 2000);
     },
   });
 
-  // ── Stage drag-and-drop (only for "My Pipeline" view) ────────────
+  // ── Stage move ────────────────────────────────────────────────────
   const moveMutation = useMutation({
     mutationFn: async ({ lead, newStage }: { lead: Lead; newStage: Stage }) => {
-      await fetch(`/api/leads/${lead.rowIndex}`, {
+      const res = await fetch(`/api/leads/${lead.rowIndex}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -117,40 +125,32 @@ export default function PipelineBoard({ activeMember }: Props) {
           },
         }),
       });
+      if (!res.ok) throw new Error('Move failed');
     },
+
     onMutate: async ({ lead, newStage }) => {
       await qc.cancelQueries({ queryKey: ['leads'] });
-      const prev = qc.getQueryData<Lead[]>(['leads']);
-      qc.setQueryData<Lead[]>(['leads'], old =>
-        (old ?? []).map(l => l.id === lead.id ? { ...l, stage: newStage } : l)
+      const snapshot = qc.getQueryData<Lead[]>(['leads']);
+      qc.setQueryData<Lead[]>(['leads'], (old = []) =>
+        old.map(l => l.id === lead.id ? { ...l, stage: newStage } : l)
       );
-      return { prev };
+      return { snapshot };
     },
-    onError: (_e, _v, ctx) => {
-      if (ctx?.prev) qc.setQueryData(['leads'], ctx.prev);
+
+    onError: (_err, _vars, ctx) => {
+      if (ctx?.snapshot) qc.setQueryData(['leads'], ctx.snapshot);
     },
-    onSettled: () => {
-      qc.invalidateQueries({ queryKey: ['leads'] });
-      qc.invalidateQueries({ queryKey: ['outreach'] });
+
+    onSuccess: () => {
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ['leads'] });
+        qc.invalidateQueries({ queryKey: ['outreach'] });
+      }, 2000);
     },
   });
 
+  // ── DnD ───────────────────────────────────────────────────────────
   const activeLead = leads.find(l => l.id === activeId);
-
-  // Split leads
-  const vacantLeads = leads.filter(l => isVacant(l));
-  const myLeads     = leads.filter(l => isOwnedBy(l, activeMember));
-
-  // Apply search
-  const applySearch = (arr: Lead[]) =>
-    !search ? arr : arr.filter(l =>
-      l.fullName.toLowerCase().includes(search.toLowerCase()) ||
-      l.email.toLowerCase().includes(search.toLowerCase()) ||
-      l.phoneNumber.includes(search)
-    );
-
-  const filteredVacant = applySearch(vacantLeads);
-  const filteredMine   = applySearch(myLeads);
 
   const handleDragStart = (e: DragStartEvent) => setActiveId(e.active.id as string);
 
@@ -158,6 +158,7 @@ export default function PipelineBoard({ activeMember }: Props) {
     setActiveId(null);
     const { active, over } = e;
     if (!over) return;
+
     const lead = leads.find(l => l.id === active.id);
     if (!lead) return;
 
@@ -174,11 +175,24 @@ export default function PipelineBoard({ activeMember }: Props) {
     }
   }, [leads, moveMutation]);
 
-  const handleClaim = async (lead: Lead) => {
-    setClaimingId(lead.id);
-    claimMutation.mutate(lead);
+  // ── Filtering ─────────────────────────────────────────────────────
+  const vacantLeads = leads.filter(isVacant);
+  const myLeads     = leads.filter(l => isOwnedBy(l, activeMember));
+
+  const applySearch = (arr: Lead[]) => {
+    if (!search.trim()) return arr;
+    const q = search.toLowerCase();
+    return arr.filter(l =>
+      l.fullName.toLowerCase().includes(q) ||
+      l.email.toLowerCase().includes(q) ||
+      l.phoneNumber.includes(q)
+    );
   };
 
+  const filteredVacant = applySearch(vacantLeads);
+  const filteredMine   = applySearch(myLeads);
+
+  // ── UI helpers ────────────────────────────────────────────────────
   const tabStyle = (active: boolean): React.CSSProperties => ({
     display: 'flex', alignItems: 'center', gap: '6px',
     padding: '7px 16px', borderRadius: '8px', fontSize: '13px', fontWeight: 500,
@@ -190,7 +204,8 @@ export default function PipelineBoard({ activeMember }: Props) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden' }}>
-      {/* Toolbar */}
+
+      {/* ── Toolbar ── */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: '10px',
         padding: '10px 20px', borderBottom: '1px solid var(--border)',
@@ -201,31 +216,22 @@ export default function PipelineBoard({ activeMember }: Props) {
           <button style={tabStyle(view === 'vacant')} onClick={() => setView('vacant')}>
             <Zap size={13} />
             Vacant Leads
-            <span style={{
-              padding: '1px 7px', borderRadius: '10px', fontSize: '11px',
-              background: 'rgba(99,102,241,.2)', color: '#818cf8',
-            }}>
+            <span style={{ padding: '1px 7px', borderRadius: '10px', fontSize: '11px', background: 'rgba(99,102,241,.2)', color: '#818cf8' }}>
               {vacantLeads.length}
             </span>
           </button>
           <button style={tabStyle(view === 'mine')} onClick={() => setView('mine')}>
             <Users size={13} />
             My Pipeline
-            <span style={{
-              padding: '1px 7px', borderRadius: '10px', fontSize: '11px',
-              background: 'rgba(79,196,207,.15)', color: 'var(--accent)',
-            }}>
+            <span style={{ padding: '1px 7px', borderRadius: '10px', fontSize: '11px', background: 'rgba(79,196,207,.15)', color: 'var(--accent)' }}>
               {myLeads.length}
             </span>
           </button>
         </div>
 
         {/* Search */}
-        <div style={{ position: 'relative', flex: '1', maxWidth: '260px' }}>
-          <span style={{
-            position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)',
-            color: 'var(--text3)', fontSize: '13px', pointerEvents: 'none',
-          }}>⌕</span>
+        <div style={{ position: 'relative', flex: 1, maxWidth: '260px' }}>
+          <span style={{ position: 'absolute', left: '10px', top: '50%', transform: 'translateY(-50%)', color: 'var(--text3)', fontSize: '13px', pointerEvents: 'none' }}>⌕</span>
           <input
             type="text"
             placeholder="Search by name, email, phone…"
@@ -245,62 +251,25 @@ export default function PipelineBoard({ activeMember }: Props) {
         </div>
       </div>
 
+      {/* ── Views ── */}
       {isLoading ? (
         <LoadingSkeleton />
-      ) : isError ? (
-        <ErrorState message={error.message} />
       ) : view === 'vacant' ? (
-        /* ── VACANT LEADS POOL ── */
-        <div style={{ flex: 1, overflowY: 'auto', padding: '20px' }}>
-          {filteredVacant.length === 0 ? (
-            <div style={{
-              display: 'flex', flexDirection: 'column', alignItems: 'center',
-              justifyContent: 'center', flex: 1, padding: '60px 20px', color: 'var(--text3)',
-            }}>
-              <Zap size={32} style={{ marginBottom: '12px', opacity: .4 }} />
-              <p style={{ fontSize: '15px', fontWeight: 500, marginBottom: '6px', color: 'var(--text2)' }}>
-                No vacant leads
-              </p>
-              <p style={{ fontSize: '13px' }}>
-                All leads have been claimed. Check back soon.
-              </p>
-            </div>
-          ) : (
-            <>
-              <p style={{ fontSize: '12px', color: 'var(--text3)', marginBottom: '16px' }}>
-                {filteredVacant.length} unclaimed leads — click <strong style={{ color: '#818cf8' }}>Claim &amp; DM</strong> to take ownership. That lead will move to your pipeline and disappear from this list for everyone else.
-              </p>
-              <div style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
-                gap: '10px',
-              }}>
-                {filteredVacant.map(lead => (
-                  <LeadCard
-                    key={lead.id}
-                    lead={lead}
-                    activeMember={activeMember}
-                    isVacant
-                    onClick={() => setSelectedLead(lead)}
-                    onClaim={handleClaim}
-                  />
-                ))}
-              </div>
-            </>
-          )}
-        </div>
+        <VacantPool
+          leads={filteredVacant}
+          activeMember={activeMember}
+          onClaim={lead => claimMutation.mutate(lead)}
+          claimingIds={claimMutation.isPending ? [] : []}
+          onCardClick={setSelectedLead}
+        />
       ) : (
-        /* ── MY PIPELINE KANBAN ── */
         <DndContext
           sensors={sensors}
           collisionDetection={closestCorners}
           onDragStart={handleDragStart}
           onDragEnd={handleDragEnd}
         >
-          <div style={{
-            display: 'flex', gap: '12px', overflowX: 'auto',
-            flex: 1, padding: '16px 20px', alignItems: 'flex-start',
-          }}>
+          <div style={{ display: 'flex', gap: '12px', overflowX: 'auto', flex: 1, padding: '16px 20px', alignItems: 'flex-start' }}>
             {STAGES.filter(s => s !== 'New Lead').map(stage => (
               <KanbanColumn
                 key={stage}
@@ -333,42 +302,58 @@ export default function PipelineBoard({ activeMember }: Props) {
   );
 }
 
-function LoadingSkeleton() {
+// ── Vacant pool grid ─────────────────────────────────────────────────
+function VacantPool({ leads, activeMember, onClaim, onCardClick }: {
+  leads: Lead[];
+  activeMember: string;
+  onClaim: (lead: Lead) => void;
+  claimingIds: string[];
+  onCardClick: (lead: Lead) => void;
+}) {
+  if (leads.length === 0) {
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, padding: '60px 20px', color: 'var(--text3)' }}>
+        <Zap size={32} style={{ marginBottom: '12px', opacity: .4 }} />
+        <p style={{ fontSize: '15px', fontWeight: 500, marginBottom: '6px', color: 'var(--text2)' }}>No vacant leads</p>
+        <p style={{ fontSize: '13px' }}>All leads have been claimed. Check back soon.</p>
+      </div>
+    );
+  }
+
   return (
-    <div style={{ display: 'flex', gap: '12px', padding: '16px 20px', flex: 1 }}>
-      {[1,2,3,4,5].map(i => (
-        <div key={i} style={{ minWidth: '208px', width: '208px' }}>
-          <div style={{ height: '28px', background: 'var(--surface2)', borderRadius: '6px', marginBottom: '12px' }} />
-          {[1,2,3].map(j => (
-            <div key={j} style={{
-              height: '100px', background: 'var(--surface)', borderRadius: '10px',
-              marginBottom: '8px', border: '1px solid var(--border)', opacity: 1 - j * 0.2,
-            }} />
-          ))}
-        </div>
-      ))}
+    <div style={{ flex: 1, overflowY: 'auto', padding: '20px' }}>
+      <p style={{ fontSize: '12px', color: 'var(--text3)', marginBottom: '16px' }}>
+        {leads.length} unclaimed lead{leads.length !== 1 ? 's' : ''} — click{' '}
+        <strong style={{ color: '#818cf8' }}>Claim &amp; DM</strong> to take ownership.
+        It will move to your pipeline and disappear for everyone else.
+      </p>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: '10px' }}>
+        {leads.map(lead => (
+          <LeadCard
+            key={lead.id}
+            lead={lead}
+            activeMember={activeMember}
+            isVacant
+            onClick={() => onCardClick(lead)}
+            onClaim={onClaim}
+          />
+        ))}
+      </div>
     </div>
   );
 }
 
-function ErrorState({ message }: { message: string }) {
+function LoadingSkeleton() {
   return (
-    <div style={{
-      display: 'flex',
-      flexDirection: 'column',
-      alignItems: 'center',
-      justifyContent: 'center',
-      flex: 1,
-      padding: '40px 20px',
-      color: 'var(--text2)',
-      textAlign: 'center',
-    }}>
-      <p style={{ fontSize: '15px', fontWeight: 600, marginBottom: '8px' }}>
-        Couldn&apos;t load leads
-      </p>
-      <p style={{ fontSize: '13px', color: 'var(--text3)', maxWidth: '420px' }}>
-        {message}
-      </p>
+    <div style={{ display: 'flex', gap: '12px', padding: '16px 20px', flex: 1 }}>
+      {[1, 2, 3, 4, 5].map(i => (
+        <div key={i} style={{ minWidth: '208px', width: '208px' }}>
+          <div style={{ height: '28px', background: 'var(--surface2)', borderRadius: '6px', marginBottom: '12px' }} />
+          {[1, 2, 3].map(j => (
+            <div key={j} style={{ height: '100px', background: 'var(--surface)', borderRadius: '10px', marginBottom: '8px', border: '1px solid var(--border)', opacity: 1 - j * 0.2 }} />
+          ))}
+        </div>
+      ))}
     </div>
   );
 }
