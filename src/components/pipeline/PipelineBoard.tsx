@@ -3,7 +3,8 @@ import { useState, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   DndContext, DragEndEvent, DragOverlay, DragStartEvent,
-  PointerSensor, useSensor, useSensors, closestCorners,
+  PointerSensor, useSensor, useSensors, closestCorners, pointerWithin,
+  rectIntersection, type CollisionDetection,
 } from '@dnd-kit/core';
 import { Lead, Stage, STAGES, STAGE_COLORS } from '@/types';
 import KanbanColumn from './KanbanColumn';
@@ -51,6 +52,16 @@ export default function PipelineBoard({ activeMember }: Props) {
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
   );
+
+  const collisionDetection: CollisionDetection = useCallback((args) => {
+    const pointerHits = pointerWithin(args);
+    if (pointerHits.length > 0) return pointerHits;
+
+    const rectHits = rectIntersection(args);
+    if (rectHits.length > 0) return rectHits;
+
+    return closestCorners(args);
+  }, []);
 
   const { data: leads = [], isLoading } = useQuery<Lead[]>({
     queryKey: ['leads'],
@@ -265,7 +276,7 @@ export default function PipelineBoard({ activeMember }: Props) {
       ) : (
         <DndContext
           sensors={sensors}
-          collisionDetection={closestCorners}
+          collisionDetection={collisionDetection}
           onDragStart={handleDragStart}
           onDragEnd={handleDragEnd}
         >
