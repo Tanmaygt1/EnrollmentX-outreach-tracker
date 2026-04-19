@@ -194,15 +194,13 @@ export default function PipelineBoard({ activeMember }: Props) {
     onMutate: async ({ lead, newStage }) => {
       await qc.cancelQueries({ queryKey: ['leads'] });
       const snapshot = qc.getQueryData<Lead[]>(['leads']);
+      const previousOverride = claimOverrides[lead.id];
 
       setClaimOverrides(prev => {
-        const existing = prev[lead.id];
-        if (!existing) return prev;
-
         return {
           ...prev,
           [lead.id]: {
-            ...existing,
+            ...(prev[lead.id] ?? {}),
             stage: newStage,
           },
         };
@@ -211,10 +209,24 @@ export default function PipelineBoard({ activeMember }: Props) {
       qc.setQueryData<Lead[]>(['leads'], (old = []) =>
         old.map(l => l.id === lead.id ? { ...l, stage: newStage } : l)
       );
-      return { snapshot };
+      return { snapshot, previousOverride, leadId: lead.id };
     },
 
     onError: (_err, _vars, ctx) => {
+      if (ctx?.leadId) {
+        setClaimOverrides(prev => {
+          const next = { ...prev };
+
+          if (ctx.previousOverride) {
+            next[ctx.leadId] = ctx.previousOverride;
+          } else {
+            delete next[ctx.leadId];
+          }
+
+          return next;
+        });
+      }
+
       if (ctx?.snapshot) qc.setQueryData(['leads'], ctx.snapshot);
     },
 
