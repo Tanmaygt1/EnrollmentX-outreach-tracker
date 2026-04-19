@@ -1,5 +1,5 @@
 'use client';
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   DndContext, DragEndEvent, DragOverlay, DragStartEvent,
@@ -48,6 +48,7 @@ export default function PipelineBoard({ activeMember }: Props) {
   const [activeId, setActiveId]       = useState<string | null>(null);
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
   const [view, setView]               = useState<View>('vacant');
+  const [claimOverrides, setClaimOverrides] = useState<Record<string, Partial<Lead>>>({});
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
@@ -71,6 +72,41 @@ export default function PipelineBoard({ activeMember }: Props) {
     placeholderData: (prev) => prev,
   });
 
+  useEffect(() => {
+    setClaimOverrides(prev => {
+      let changed = false;
+      const next = { ...prev };
+
+      for (const [leadId, override] of Object.entries(prev)) {
+        const lead = leads.find(item => item.id === leadId);
+
+        if (!lead) {
+          delete next[leadId];
+          changed = true;
+          continue;
+        }
+
+        const claimSynced =
+          lead.dmed === override.dmed &&
+          lead.dmedBy === override.dmedBy &&
+          lead.assignedTo === override.assignedTo &&
+          lead.stage === override.stage;
+
+        if (claimSynced) {
+          delete next[leadId];
+          changed = true;
+        }
+      }
+
+      return changed ? next : prev;
+    });
+  }, [leads]);
+
+  const boardLeads = leads.map(lead => ({
+    ...lead,
+    ...(claimOverrides[lead.id] ?? {}),
+  }));
+
   // ── Claim ─────────────────────────────────────────────────────────
   const claimMutation = useMutation({
     mutationFn: async (lead: Lead) => {
@@ -91,11 +127,22 @@ export default function PipelineBoard({ activeMember }: Props) {
     onMutate: async (lead) => {
       await qc.cancelQueries({ queryKey: ['leads'] });
       const snapshot = qc.getQueryData<Lead[]>(['leads']);
+      const claimOverride: Partial<Lead> = {
+        dmed: 'Yes',
+        dmedBy: activeMember,
+        assignedTo: activeMember,
+        stage: 'DMed',
+      };
+
+      setClaimOverrides(prev => ({
+        ...prev,
+        [lead.id]: claimOverride,
+      }));
 
       qc.setQueryData<Lead[]>(['leads'], (old = []) =>
         old.map(l =>
           l.id === lead.id
-            ? { ...l, dmed: 'Yes', dmedBy: activeMember, assignedTo: activeMember, stage: 'DMed' }
+            ? { ...l, ...claimOverride }
             : l
         )
       );
@@ -104,7 +151,12 @@ export default function PipelineBoard({ activeMember }: Props) {
     },
 
     // 2. On error, roll back
-    onError: (_err, _lead, ctx) => {
+    onError: (_err, lead, ctx) => {
+      setClaimOverrides(prev => {
+        const next = { ...prev };
+        delete next[lead.id];
+        return next;
+      });
       if (ctx?.snapshot) qc.setQueryData(['leads'], ctx.snapshot);
     },
 
@@ -161,7 +213,7 @@ export default function PipelineBoard({ activeMember }: Props) {
   });
 
   // ── DnD ───────────────────────────────────────────────────────────
-  const activeLead = leads.find(l => l.id === activeId);
+  const activeLead = boardLeads.find(l => l.id === activeId);
 
   const handleDragStart = (e: DragStartEvent) => setActiveId(e.active.id as string);
 
@@ -170,25 +222,25 @@ export default function PipelineBoard({ activeMember }: Props) {
     const { active, over } = e;
     if (!over) return;
 
-    const lead = leads.find(l => l.id === active.id);
+    const lead = boardLeads.find(l => l.id === active.id);
     if (!lead) return;
 
     let newStage: Stage | undefined;
     if (STAGES.includes(over.id as Stage)) {
       newStage = over.id as Stage;
     } else {
-      const overLead = leads.find(l => l.id === over.id);
+      const overLead = boardLeads.find(l => l.id === over.id);
       if (overLead) newStage = overLead.stage;
     }
 
     if (newStage && newStage !== lead.stage) {
       moveMutation.mutate({ lead, newStage });
     }
-  }, [leads, moveMutation]);
+  }, [boardLeads, moveMutation]);
 
   // ── Filtering ─────────────────────────────────────────────────────
-  const vacantLeads = leads.filter(isVacant);
-  const myLeads     = leads.filter(l => isOwnedBy(l, activeMember));
+  const vacantLeads = boardLeads.filter(isVacant);
+  const myLeads     = boardLeads.filter(l => isOwnedBy(l, activeMember));
 
   const applySearch = (arr: Lead[]) => {
     if (!search.trim()) return arr;
