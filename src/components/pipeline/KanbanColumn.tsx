@@ -36,7 +36,7 @@ export default function KanbanColumn({ stage, leads, activeMember, onCardClick }
           transition: 'all .15s',
         }}
       >
-        <SortableContext items={leads.map(l => l.id)} strategy={verticalListSortingStrategy}>
+        <SortableContext id={stage} items={leads.map(l => l.id)} strategy={verticalListSortingStrategy}>
           {leads.map(lead => (
             <LeadCard
               key={lead.id}

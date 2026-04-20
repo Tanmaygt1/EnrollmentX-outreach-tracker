@@ -255,8 +255,13 @@ export default function PipelineBoard({ activeMember }: Props) {
     if (STAGES.includes(over.id as Stage)) {
       newStage = over.id as Stage;
     } else {
-      const overLead = boardLeads.find(l => l.id === over.id);
-      if (overLead) newStage = overLead.stage;
+      const overContainerId = over.data.current?.sortable?.containerId;
+      if (overContainerId && STAGES.includes(overContainerId as Stage)) {
+        newStage = overContainerId as Stage;
+      } else {
+        const overLead = boardLeads.find(l => l.id === over.id);
+        if (overLead) newStage = overLead.stage;
+      }
     }
 
     if (newStage && newStage !== lead.stage) {
