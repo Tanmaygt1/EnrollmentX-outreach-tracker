@@ -66,7 +66,7 @@ export default function PipelineBoard({ activeMember }: Props) {
 
   const { data: leads = [], isLoading } = useQuery<Lead[]>({
     queryKey: ['leads'],
-    queryFn: () => fetch('/api/leads').then(r => r.json()),
+    queryFn: () => fetch('/api/leads', { cache: 'no-store' }).then(r => r.json()),
     refetchInterval: 30_000,
     // Keep previous data while fetching so the board never flickers blank
     placeholderData: (prev) => prev,

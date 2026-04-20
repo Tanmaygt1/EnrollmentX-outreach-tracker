@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { updateLeadFields, appendOutreachLog } from '@/lib/sheets';
 
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 /**
  * PATCH /api/leads/[rowIndex]
  *
@@ -27,7 +30,15 @@ export async function PATCH(
     const rowIndex = parseInt(params.rowIndex, 10);
 
     if (isNaN(rowIndex)) {
-      return NextResponse.json({ error: 'Invalid rowIndex' }, { status: 400 });
+      return NextResponse.json(
+        { error: 'Invalid rowIndex' },
+        {
+          status: 400,
+          headers: {
+            'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+          },
+        }
+      );
     }
 
     // ── Claim action ──────────────────────────────────────────────
@@ -39,7 +50,15 @@ export async function PATCH(
       };
 
       if (!teamMember) {
-        return NextResponse.json({ error: 'teamMember required for claim' }, { status: 400 });
+        return NextResponse.json(
+          { error: 'teamMember required for claim' },
+          {
+            status: 400,
+            headers: {
+              'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+            },
+          }
+        );
       }
 
       await updateLeadFields(rowIndex, {
@@ -59,7 +78,11 @@ export async function PATCH(
         notes:          '',
       });
 
-      return NextResponse.json({ ok: true });
+      return NextResponse.json({ ok: true }, {
+        headers: {
+          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        },
+      });
     }
 
     // ── Generic field update ──────────────────────────────────────
@@ -85,9 +108,21 @@ export async function PATCH(
       });
     }
 
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ ok: true }, {
+      headers: {
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      },
+    });
   } catch (err) {
     console.error('[PATCH /api/leads/[rowIndex]]', err);
-    return NextResponse.json({ error: 'Failed to update lead' }, { status: 500 });
+    return NextResponse.json(
+      { error: 'Failed to update lead' },
+      {
+        status: 500,
+        headers: {
+          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        },
+      }
+    );
   }
 }
